@@ -42,6 +42,34 @@ func (timeoutError) Timeout() bool   { return true }
 // ErrTimeout is returned when a read, write, open or accept deadline expires.
 var ErrTimeout net.Error = timeoutError{}
 
+// SessionError wraps a session-level failure that is not one of the public
+// sentinel errors, such as a transport read/write error.
+type SessionError struct {
+	Err error
+}
+
+func (e *SessionError) Error() string {
+	if e.Err == nil {
+		return "mux: session error"
+	}
+	return "mux: session: " + e.Err.Error()
+}
+
+func (e *SessionError) Unwrap() error { return e.Err }
+
+// wrapSessionError adds session context to transport errors while leaving the
+// protocol/flow-control sentinels untouched.
+func wrapSessionError(err error) error {
+	if err == nil ||
+		errors.Is(err, ErrSessionClosed) ||
+		errors.Is(err, ErrProtocol) ||
+		errors.Is(err, ErrFlowControl) ||
+		errors.Is(err, ErrKeepAliveTimeout) {
+		return err
+	}
+	return &SessionError{Err: err}
+}
+
 // StreamError describes a stream-level failure carrying a wire error code.
 type StreamError struct {
 	ID   uint32
@@ -56,7 +84,15 @@ func (e *StreamError) Error() string {
 	return fmt.Sprintf("mux: stream %d: %s", e.ID, e.Code)
 }
 
-func (e *StreamError) Unwrap() error { return e.Err }
+// Unwrap exposes both the generic reset marker and the specific cause, so
+// errors.Is(err, ErrStreamReset) works for every RST code while
+// errors.Is(err, ErrProtocol) etc. still distinguishes the reason.
+func (e *StreamError) Unwrap() []error {
+	if e.Err == nil || e.Err == ErrStreamReset {
+		return []error{ErrStreamReset}
+	}
+	return []error{ErrStreamReset, e.Err}
+}
 
 func newStreamError(id uint32, code wire.ErrorCode) error {
 	var base error

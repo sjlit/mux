@@ -68,6 +68,24 @@ below, so it remains opt-in.
 - Control frames are bounded (4K entries); repeated RSTs for the same stream
   are coalesced and PONGs are dropped above a high-water mark during a PING
   flood.
+- The unknown/closed-stream discard budget is a token bucket: it refills
+  lazily over 60 seconds and the automatically derived value is capped at
+  256 MiB. Exhausting it closes the session with `ErrProtocol` after a
+  best-effort `GOAWAY(ENHANCE_YOUR_CALM)`.
+- `Stream.Close` sends `RST(CANCEL)` when local unread data remains and the
+  peer can still send; otherwise it flushes queued writes and sends a FIN.
+  `Close` and `CloseWrite` are bounded by `CloseTimeout`; `CloseWrite` also
+  honors an earlier `SetWriteDeadline`. A `conn.Write` that is already blocked
+  cannot be interrupted, so the FIN may be completed in the background after
+  `Close` returns `ErrTimeout`.
+- Any RST satisfies `errors.Is(err, ErrStreamReset)`; the specific reason is
+  still available through `ErrProtocol`, `ErrFlowControl`,
+  `ErrRefusedStream`, and the `StreamError.Code` field.
+- `Session.CloseGraceful` rejects streams that are still waiting in the accept
+  queue instead of waiting for the application to accept them. It returns the
+  context error if the drain deadline expires. `Session.PeerGoAway` and
+  `Session.CloseError` expose the peer's GOAWAY code and the local close
+  reason; transport failures are wrapped in `*SessionError`.
 - A write deadline cannot interrupt a `conn.Write` that is already in progress.
   A blocked write is completed or the underlying connection must be closed
   (`Session.Abort`/`Session.Close`) to unblock it.

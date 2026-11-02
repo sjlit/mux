@@ -2,6 +2,7 @@ package mux
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -276,7 +277,7 @@ func TestKeepAlivePingPong(t *testing.T) {
 	waitSettings(t, srv)
 
 	deadline := time.Now().Add(2 * time.Second)
-	for cli.lastRTT.Load() == 0 || srv.lastRTT.Load() == 0 {
+	for cli.RTT() == 0 || srv.RTT() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("timed out waiting for PONG")
 		}
@@ -395,8 +396,8 @@ func TestCloseGracefulTimesOutWithOpenStream(t *testing.T) {
 	_, _ = openTestStream(t, cli, srv)
 
 	start := time.Now()
-	if err := cli.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := cli.Close(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close = %v, want context deadline exceeded", err)
 	}
 	if d := time.Since(start); d > 2*time.Second {
 		t.Fatalf("Close took %v", d)

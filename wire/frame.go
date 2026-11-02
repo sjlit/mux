@@ -1,6 +1,6 @@
 // Package wire implements the mux v3 wire protocol codec.
 //
-// The frame format is specified in v3/PROTOCOL.md. The codec is stateless:
+// The frame format is specified in PROTOCOL.md. The codec is stateless:
 // DecodeFrame parses at most one frame from the front of a byte slice and
 // reports how many bytes it consumed, so callers can feed it arbitrarily
 // fragmented or coalesced transport reads.

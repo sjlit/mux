@@ -31,6 +31,16 @@ const (
 	// unknownFrameOverhead charges per-frame bookkeeping to the unknown-stream
 	// budget. Without it, zero-length or one-byte frames cost nothing.
 	unknownFrameOverhead = 256
+	// unknownBudgetRefillPeriod is how long an idle session takes to refill a
+	// completely exhausted unknown-stream budget. Refilling is lazy and only
+	// happens when another unknown frame is charged.
+	unknownBudgetRefillPeriod = 60 * time.Second
+	// maxAutoUnknownBudget caps the budget derived from the session window so
+	// an unusually large window cannot create a multi-gigabyte allowance.
+	maxAutoUnknownBudget = 256 << 20
+	// goAwayDrainTimeout bounds the best-effort GOAWAY write before a fatal
+	// protocol error closes the transport.
+	goAwayDrainTimeout = 100 * time.Millisecond
 )
 
 // Session multiplexes streams over one reliable, ordered byte stream.
@@ -56,10 +66,14 @@ type Session struct {
 	goAway       atomic.Bool
 	goAwaySent   atomic.Bool
 
-	highestPeerID uint32
-	peerIDMu      sync.Mutex
-	localOpen     atomic.Int32
-	remoteOpen    atomic.Int32
+	highestPeerID       uint32 // highest peer id seen, including refused streams
+	lastProcessedPeerID uint32 // highest peer id queued for Accept (peerIDMu)
+	peerGoAwayCode      wire.ErrorCode
+	peerGoAwayLastID    uint32
+	peerGoAwaySet       bool
+	peerIDMu            sync.Mutex
+	localOpen           atomic.Int32
+	remoteOpen          atomic.Int32
 
 	settingsMu      sync.Mutex
 	peerSettingsSet atomic.Bool
@@ -107,9 +121,10 @@ type Session struct {
 	lastRTT        atomic.Int64
 	pendingReadErr error // recvLoop only: drain buffered frames before failing
 
-	bufferedFrames   atomic.Int64 // queued PSH payloads across all streams
-	unknownBudget    atomic.Int64
-	unknownBudgetMax int64
+	bufferedFrames       atomic.Int64 // queued PSH payloads across all streams
+	unknownBudget        int64        // recvLoop only
+	unknownBudgetMax     int64
+	unknownBudgetUpdated time.Time // recvLoop only
 
 	blockPool *blockPools
 
@@ -151,8 +166,12 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 		if s.unknownBudgetMax < 1<<20 {
 			s.unknownBudgetMax = 1 << 20
 		}
+		if s.unknownBudgetMax > maxAutoUnknownBudget {
+			s.unknownBudgetMax = maxAutoUnknownBudget
+		}
 	}
-	s.unknownBudget.Store(s.unknownBudgetMax)
+	s.unknownBudget = s.unknownBudgetMax
+	s.unknownBudgetUpdated = time.Now()
 
 	settings := wire.Settings{
 		Version:              uint16(wire.Version),
@@ -315,6 +334,28 @@ func (s *Session) CloseChan() <-chan struct{} {
 	return s.die
 }
 
+// RTT returns the most recently measured PING/PONG round-trip time, or zero
+// when no RTT sample is available.
+func (s *Session) RTT() time.Duration {
+	if ns := s.lastRTT.Load(); ns > 0 {
+		return time.Duration(ns)
+	}
+	return 0
+}
+
+// CloseError returns the reason the session closed, or nil while it is open.
+func (s *Session) CloseError() error {
+	return s.closeError()
+}
+
+// PeerGoAway reports the error code and effective last processed stream ID
+// from GOAWAY frames received from the peer.
+func (s *Session) PeerGoAway() (wire.ErrorCode, uint32, bool) {
+	s.peerIDMu.Lock()
+	defer s.peerIDMu.Unlock()
+	return s.peerGoAwayCode, s.peerGoAwayLastID, s.peerGoAwaySet
+}
+
 func (s *Session) closeError() error {
 	select {
 	case <-s.die:
@@ -433,6 +474,9 @@ func (s *Session) newLocalStream() (*Stream, bool, error) {
 	// load-then-add lets two OpenStream calls both pass a peer limit of one.
 	reserved := false
 	if limit := s.peerMaxStreams.Load(); limit != wire.UnlimitedStreams {
+		if limit == 0 {
+			return nil, false, ErrRefusedStream
+		}
 		for {
 			cur := s.localOpen.Load()
 			if uint32(cur) >= limit {
@@ -479,6 +523,12 @@ func (s *Session) newLocalStream() (*Stream, bool, error) {
 		s.removeStream(st)
 		return nil, false, s.closeError()
 	}
+	// Close/GOAWAY may have won the race after the initial check. Remove the
+	// just-created stream instead of returning one the peer will not process.
+	if s.goAway.Load() {
+		s.removeStream(st)
+		return nil, false, ErrGoAway
+	}
 	return st, false, nil
 }
 
@@ -501,23 +551,25 @@ func (s *Session) finishOpen(ctx context.Context, st *Stream, deadline time.Time
 			s.removeStream(st)
 			return nil, err
 		}
+		if st.aborted.Load() {
+			s.removeStream(st)
+			return nil, st.getErr()
+		}
 		return st, nil
 	case <-ctx.Done():
 		b.canceled.Store(true)
 		s.signal()
-		<-b.done
-		b.release()
 		st.Reset(wire.CodeCancel)
 		return nil, ctx.Err()
 	case <-timer.C:
 		b.canceled.Store(true)
 		s.signal()
-		<-b.done
-		b.release()
 		st.Reset(wire.CodeCancel)
 		if ctxDeadline {
-			<-ctx.Done()
-			return nil, ctx.Err()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, context.DeadlineExceeded
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -526,8 +578,6 @@ func (s *Session) finishOpen(ctx context.Context, st *Stream, deadline time.Time
 	case <-s.die:
 		b.canceled.Store(true)
 		s.signal()
-		<-b.done
-		b.release()
 		s.removeStream(st)
 		return nil, s.closeError()
 	}
@@ -570,7 +620,7 @@ func (s *Session) AcceptStreamContext(ctx context.Context) (*Stream, error) {
 
 func (s *Session) lastPeerStreamID() uint32 {
 	s.peerIDMu.Lock()
-	id := s.highestPeerID
+	id := s.lastProcessedPeerID
 	s.peerIDMu.Unlock()
 	return id
 }
@@ -621,6 +671,11 @@ func (s *Session) newIncomingStream(f wire.Frame) (*Stream, error) {
 			s.removeStream(st)
 			return nil, s.closeError()
 		}
+		s.peerIDMu.Lock()
+		if id > s.lastProcessedPeerID {
+			s.lastProcessedPeerID = id
+		}
+		s.peerIDMu.Unlock()
 		return st, nil
 	default:
 		s.streams.del(id)
@@ -656,6 +711,10 @@ func (s *Session) handlePSH(f wire.Frame, owner frameOwner) {
 			s.fail(err)
 			return
 		}
+	} else if f.Flags&wire.FlagSYN != 0 {
+		owner.release()
+		s.fail(fmt.Errorf("%w: duplicate SYN on stream %d", ErrProtocol, st.id))
+		return
 	}
 
 	if f.Flags&wire.FlagCredit != 0 {
@@ -675,20 +734,82 @@ func (s *Session) discardPSH(f wire.Frame, owner frameOwner) {
 	}
 }
 
+// refillUnknownBudget lazily restores the unknown-stream discard budget. A
+// fully exhausted budget recovers over unknownBudgetRefillPeriod, which keeps
+// ordinary close races from eventually killing a long-lived session while
+// still bounding sustained garbage traffic.
+func (s *Session) refillUnknownBudget(now time.Time) {
+	if s.unknownBudgetMax <= 0 || s.unknownBudget >= s.unknownBudgetMax {
+		s.unknownBudgetUpdated = now
+		return
+	}
+	elapsed := now.Sub(s.unknownBudgetUpdated)
+	if elapsed <= 0 {
+		return
+	}
+	if elapsed >= unknownBudgetRefillPeriod {
+		s.unknownBudget = s.unknownBudgetMax
+		s.unknownBudgetUpdated = now
+		return
+	}
+
+	rate := s.unknownBudgetMax / int64(unknownBudgetRefillPeriod/time.Second)
+	if rate < 1 {
+		rate = 1
+	}
+	// Split the duration to keep the multiply from overflowing for
+	// user-configured budgets that are close to MaxInt64.
+	add := int64(elapsed/time.Second)*rate +
+		int64(elapsed%time.Second)*rate/int64(time.Second)
+	if add <= 0 {
+		return
+	}
+	s.unknownBudget += add
+	if s.unknownBudget > s.unknownBudgetMax {
+		s.unknownBudget = s.unknownBudgetMax
+	}
+	s.unknownBudgetUpdated = now
+}
+
+// failWithGoAway makes one bounded attempt to tell the peer why the session
+// is being torn down, then fails it. It must only be called from recvLoop or
+// another goroutine that is not the writer.
+func (s *Session) failWithGoAway(code wire.ErrorCode, err error) {
+	if s.IsClosed() {
+		s.fail(err)
+		return
+	}
+	s.goAway.Store(true)
+	s.goAwaySent.Store(true)
+	s.stateNotify.notify()
+	done := make(chan struct{})
+	s.enqueueCtrlDone(wire.NewGOAWAYFrame(s.lastPeerStreamID(), code), done)
+	timer := time.NewTimer(goAwayDrainTimeout)
+	select {
+	case <-done:
+	case <-timer.C:
+	case <-s.die:
+	}
+	stopTimer(timer)
+	s.fail(err)
+}
+
 func (s *Session) discardPayload(f wire.Frame, owner frameOwner) {
 	n := len(f.Payload)
 	owner.release()
 	// Charge per-frame bookkeeping as well as payload bytes. Otherwise a peer
 	// can send an unlimited number of zero-length or one-byte frames without
 	// ever exhausting the budget.
-	s.unknownBudget.Add(-(int64(n) + unknownFrameOverhead))
+	s.refillUnknownBudget(time.Now())
+	s.unknownBudget -= int64(n) + unknownFrameOverhead
 	if n > 0 {
 		s.sessionRecvBytes.Add(uint32(n))
 		s.sessionConsumed.Add(uint32(n))
-		s.maybeSendSessionUPD()
+		s.publishSessionCredit()
 	}
-	if s.unknownBudget.Load() < 0 {
-		s.fail(fmt.Errorf("%w: unknown-stream discard budget exhausted", ErrProtocol))
+	if s.unknownBudget < 0 {
+		s.failWithGoAway(wire.CodeEnhanceYourCalm,
+			fmt.Errorf("%w: unknown-stream discard budget exhausted", ErrProtocol))
 	}
 }
 
@@ -723,11 +844,31 @@ func (s *Session) handleControl(f wire.Frame) error {
 			}
 		}
 	case wire.TypeGOAWAY:
-		if _, err := f.Code(); err != nil {
+		code, err := f.Code()
+		if err != nil {
 			return fmt.Errorf("%w: %v", ErrProtocol, err)
 		}
+		last := f.StreamID
+		s.peerIDMu.Lock()
+		if !s.peerGoAwaySet {
+			s.peerGoAwayCode = code
+			s.peerGoAwayLastID = last
+			s.peerGoAwaySet = true
+		} else if last < s.peerGoAwayLastID {
+			s.peerGoAwayLastID = last
+		}
+		effectiveLast := s.peerGoAwayLastID
+		s.peerIDMu.Unlock()
+
 		s.goAway.Store(true)
 		s.stateNotify.notify()
+		// Streams above last_stream_id were not processed by the peer. Fail
+		// them now instead of waiting for an RST that may never arrive.
+		for _, st := range s.streams.snapshot() {
+			if st.local && st.id > effectiveLast {
+				st.remoteReset(wire.CodeRefusedStream)
+			}
+		}
 	default:
 		return fmt.Errorf("%w: unexpected control frame %s", ErrProtocol, f.Type)
 	}
@@ -790,14 +931,50 @@ func (s *Session) applySessionCredit(consumed uint32) {
 	s.creditNotify.notify()
 }
 
-func (s *Session) maybeSendSessionUPD() {
-	consumed := s.sessionConsumed.Load()
-	threshold := int32(s.recvSessionWindow / 2)
-	if itimediff(consumed, s.lastSessionSent.Load()) < threshold {
+// publishSessionCredit combines the normal half-window update with the
+// pressure-driven one. Discard paths use it because they may advance consumed
+// while a Read is already blocked on another stream.
+func (s *Session) publishSessionCredit() {
+	if s.sessionWindowPressure() {
+		s.sendSessionUPD(true)
 		return
 	}
+	s.sendSessionUPD(false)
+}
+
+// sessionWindowPressure reports whether enough received-but-unconsumed data
+// is queued that the peer may be blocked on the session window.
+func (s *Session) sessionWindowPressure() bool {
+	inflight := int32(s.sessionRecvBytes.Load() - s.sessionConsumed.Load())
+	return inflight >= int32(s.recvSessionWindow/2)
+}
+
+// maybeSendSessionUPDOnPressure publishes pending consumed credit when incoming
+// data pushes the session buffer past its half-window mark. This matters when
+// a Read is already blocked on another stream and cannot itself trigger the
+// update.
+func (s *Session) maybeSendSessionUPDOnPressure() {
+	consumed := s.sessionConsumed.Load()
+	if itimediff(consumed, s.lastSessionSent.Load()) <= 0 {
+		return
+	}
+	if !s.sessionWindowPressure() {
+		return
+	}
+	s.sendSessionUPD(true)
+}
+
+// sendSessionUPD advertises the absolute session consumed counter. force
+// bypasses the half-window threshold and is used before a Read blocks and
+// when buffered data is discarded, so other streams cannot be left without
+// session credit.
+func (s *Session) sendSessionUPD(force bool) {
+	consumed := s.sessionConsumed.Load()
+	threshold := int32(s.recvSessionWindow / 2)
+
 	s.sessionUpdMu.Lock()
-	if itimediff(consumed, s.lastSessionSent.Load()) < threshold {
+	delta := itimediff(consumed, s.lastSessionSent.Load())
+	if delta <= 0 || (!force && delta < threshold) {
 		s.sessionUpdMu.Unlock()
 		return
 	}
@@ -864,12 +1041,32 @@ func (s *Session) drainAccepts(err error) {
 	}
 }
 
+// rejectAccepts discards peer streams that were never handed to the
+// application. It is used during graceful shutdown so Close does not wait for
+// an accept loop that has already stopped.
+func (s *Session) rejectAccepts(err error) {
+	for {
+		select {
+		case st := <-s.chAccepts:
+			if st == nil {
+				continue
+			}
+			if !st.accepted.Load() && !s.IsClosed() {
+				s.enqueueCtrl(wire.NewRSTFrame(st.id, wire.CodeRefusedStream))
+			}
+			st.sessionClosed(err)
+		default:
+			return
+		}
+	}
+}
+
 func (s *Session) fail(err error) {
 	if err == nil {
 		err = ErrSessionClosed
 	}
 	s.closeOnce.Do(func() {
-		s.closeErr = err
+		s.closeErr = wrapSessionError(err)
 		close(s.die)
 		s.connCloseOnce.Do(func() {
 			_ = s.conn.Close()
@@ -893,7 +1090,7 @@ func (s *Session) failRead(err error) {
 		err = ErrSessionClosed
 	}
 	s.closeOnce.Do(func() {
-		s.closeErr = err
+		s.closeErr = wrapSessionError(err)
 		s.goAway.Store(true)
 		// Mark streams before closing the session die. A concurrent Read can
 		// wake on the session die and return the transport error immediately;
@@ -916,8 +1113,10 @@ func (s *Session) failRead(err error) {
 	})
 }
 
-// Close gracefully shuts the session down: it sends GOAWAY, waits up to
-// CloseTimeout for active streams, then closes the underlying connection.
+// Close gracefully shuts the session down: it sends GOAWAY, rejects streams
+// still waiting in the accept queue, waits up to CloseTimeout for accepted
+// streams, then closes the underlying connection. It returns the context
+// deadline error if the drain does not finish in time.
 func (s *Session) Close() error {
 	if s.IsClosed() {
 		s.loops.Wait()
@@ -928,7 +1127,8 @@ func (s *Session) Close() error {
 	return s.CloseGraceful(ctx)
 }
 
-// CloseGraceful is Close with a caller-provided drain deadline.
+// CloseGraceful is Close with a caller-provided drain deadline. It returns
+// ctx.Err() when the deadline/cancellation prevents a clean drain.
 func (s *Session) CloseGraceful(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -939,26 +1139,39 @@ func (s *Session) CloseGraceful(ctx context.Context) error {
 	}
 	s.goAway.Store(true)
 	s.stateNotify.notify()
+	// Unaccepted streams are not owned by the application; release them
+	// before blocking on GOAWAY or on the accepted-stream drain.
+	s.rejectAccepts(ErrGoAway)
 
+	timedOut := false
 	if !s.goAwaySent.Swap(true) {
 		done := make(chan struct{})
 		s.enqueueCtrlDone(wire.NewGOAWAYFrame(s.lastPeerStreamID(), wire.CodeNoError), done)
 		select {
 		case <-done:
 		case <-ctx.Done():
+			timedOut = true
 		case <-s.die:
 		}
 	}
 
 drain:
-	for s.streams.len() > 0 {
+	for {
+		// Streams that were never accepted are not owned by the application.
+		// Reject them so Close only waits for accepted streams.
+		s.rejectAccepts(ErrGoAway)
+		if s.streams.len() == 0 {
+			break
+		}
 		wake := s.stateNotify.wait()
+		s.rejectAccepts(ErrGoAway)
 		if s.streams.len() == 0 {
 			break
 		}
 		select {
 		case <-wake:
 		case <-ctx.Done():
+			timedOut = true
 			break drain
 		case <-s.die:
 			break drain
@@ -967,6 +1180,12 @@ drain:
 
 	s.fail(ErrSessionClosed)
 	s.loops.Wait()
+	if timedOut {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return ErrTimeout
+	}
 	return nil
 }
 

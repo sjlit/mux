@@ -232,29 +232,25 @@ func TestWriteFramesBuildFailureCompletesAllData(t *testing.T) {
 	}
 }
 
-func TestResetWaitsForInFlightWrite(t *testing.T) {
+func TestResetQueuesRSTWithoutWaitingForWriteMu(t *testing.T) {
 	s := newWriteFramesSession(&fixedConn{})
 	st := newStream(s, 1, true, 0)
 
+	// Reset must not wait for a Write that is blocked inside conn.Write.
+	// Ordering is provided by submitMu and connMu, not by writeMu.
 	st.writeMu.Lock()
 	done := make(chan struct{})
 	go func() {
 		_ = st.Reset(wire.CodeCancel)
 		close(done)
 	}()
-
-	select {
-	case <-done:
-		t.Fatal("Reset returned while a write held writeMu")
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	st.writeMu.Unlock()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("Reset did not return after writeMu was released")
+		st.writeMu.Unlock()
+		t.Fatal("Reset blocked behind writeMu")
 	}
+	st.writeMu.Unlock()
 
 	s.ctrlMu.Lock()
 	defer s.ctrlMu.Unlock()

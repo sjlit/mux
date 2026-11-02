@@ -115,11 +115,13 @@
 
 ### 5.5 GOAWAY
 
-- `Stream ID` = 本端已处理的最高对端流 id（`last_stream_id`）。
+- `Stream ID` = 本端已处理的最高对端流 id（`last_stream_id`）。因 accept 队列满或
+  并发流超限而被 `REFUSED_STREAM` 拒绝的流 MUST NOT 计入该值。
 - payload = error code。
 - 发送后本端 MUST NOT 再发起新流；收到后本端 MUST NOT 再发起新流。
+- 收到 GOAWAY 时，本地 id 大于 `last_stream_id` 的流 MUST 以
+  `ErrRefusedStream`/`REFUSED_STREAM` 失败，因为对端不会处理它们。
 - 存量流可以继续，直到双方 FIN/RST；实现可以在超时后 abort。
-- 对端可以对 `last_stream_id` 之上的本地流返回 `ErrRefusedStream`。
 
 ### 5.6 SETTINGS
 
@@ -172,7 +174,9 @@
 3. 收到第一个非 SETTINGS 帧 → protocol error，关闭连接。
 4. 收到版本 != 3 的第一个字节 → 立即关闭，不做 v1/v2 回退。
 5. `GOAWAY` 后停止发起新流；存量流继续。
-6. `Session.Close(ctx)`：发送 GOAWAY，等待存量流结束或 ctx 超时，然后关闭 conn。
+6. `Session.Close()` / `Session.CloseGraceful(ctx)`：发送 GOAWAY，拒绝尚未被应用
+   accept 的流（RST(REFUSED_STREAM)），等待已接受流结束或超时，然后关闭 conn；
+   超时返回 ctx 错误。
 7. `Session.Abort()`：立即关闭 conn，所有流返回 `ErrSessionClosed`。
 8. 下面任一情况立即 abort：
    - 底层读/写错误；
@@ -192,7 +196,7 @@
 - 每次 +2；MUST NOT 复用。
 - 对端发起的流 id 必须符合对端 parity，否则 protocol error。
 - 对端发起的 id 必须严格递增；`F_SYN` 的 id <= 已接受的最高对端 id → protocol error。
-- id 耗尽：发送 `GOAWAY(last_stream_id, NO_ERROR)`，本端 `OpenStream` 返回 `ErrStreamIDExhausted`。
+- id 耗尽：发送 `GOAWAY(last_stream_id, STREAM_ID_EXHAUSTED)`，本端 `OpenStream` 返回 `ErrStreamIDExhausted`。
 
 ### 7.2 状态机
 
@@ -226,21 +230,29 @@
 - 若流已被 Accept：`Read`/`Write` 返回 `StreamError{Code}`。
 - FIN 不把流从 accept 队列移除；应用会看到带 EOF 的流。
 - accept 队列长度有上限；满时对新 `F_SYN` 回 `RST(REFUSED_STREAM)`，丢弃 payload 并回补 credit。
+- 优雅关闭时，仍在 accept 队列中且未被应用接受的对端流同样回
+  `RST(REFUSED_STREAM)`，不等待 `CloseTimeout`。
 
 ### 7.4 关闭语义
 
-- `CloseWrite()`：发送 FIN（可带最后一块数据），之后本地写返回 `ErrClosedPipe`，仍可读。
+- `CloseWrite()`：发送 FIN（可带最后一块数据），之后本地写返回 `ErrWriteClosed`，仍可读。
+  FIN 最多等待 `close_timeout`；超时返回 `ErrTimeout`，FIN 可在后台继续发送。
 - `Close()`：
-  - 若本地未发 FIN 且没有未读数据：发 FIN；
-  - 若存在未读数据、或对端未 FIN、或流已异常：发 `RST(CANCEL)`；
-  - 本地资源立即释放，不等待对端。
-- `Reset(err)`：直接发 RST，丢弃双向数据。
+  - 若存在本地未读数据且对端尚未 FIN：发 `RST(CANCEL)`，不等待对端；
+  - 否则：刷新已排队数据并发 FIN。对端未 FIN 不单独触发 RST，允许正常的单方半关闭；
+  - 本地资源在 teardown 帧提交后释放；FIN 最多等待 `close_timeout`，超时返回
+    `ErrTimeout`，但 FIN 仍可在后台完成。
+- `Reset(code)`：直接发 RST，丢弃双向数据。
 - `CloseRead()`：v3 建议等价于 `RST(CANCEL)`（不引入额外的 `STOP_SENDING` 类型）；如果后续需要真正的半关闭读，再新增帧类型。
 
 ### 7.5 错误
 
-- RST / GOAWAY 的 error code 映射到 `StreamError` / `SessionError`。
-- `errors.Is(err, ErrStreamReset)`、`ErrRefusedStream`、`ErrFlowControl`、`ErrProtocol` 等。
+- RST 的 error code 映射到 `StreamError`；GOAWAY code/last_stream_id 通过
+  `Session.PeerGoAway()` 读取，session 关闭原因通过 `Session.CloseError()` 读取。
+  底层传输错误会用 `*SessionError` 包装，同时保留 `errors.Is` 链。
+- 任意 RST code 都满足 `errors.Is(err, ErrStreamReset)`；具体原因仍可用
+  `errors.Is(err, ErrRefusedStream)`、`ErrFlowControl`、`ErrProtocol` 等判断。
+- 收到 GOAWAY 后可通过 `Session.PeerGoAway()` 读取 code 和 last_stream_id。
 - 应用关闭流不应导致整个 session 关闭；只有协议/IO/流控错误才关闭 session。
 
 ---
@@ -263,6 +275,10 @@
 
 - 流窗口：`consumed - lastSentConsumed >= window/2` 时发送 `UPD sid=S`。
 - session 窗口：`consumed - lastSentSessionConsumed >= sessionWindow/2` 时发送 `UPD sid=0`。
+- 当 session 接收缓冲占用达到窗口一半时，接收方 MUST 在 `Read` 即将阻塞前强制
+  刷新已消费但尚未通告的 stream 和 session credit；新数据到达使占用跨过该阈值时
+  也应刷新。否则应用可能在一条流上等待，而 session 窗口被其他流占满，形成跨流
+  head-of-line 死锁。
 - 应用停止读取时，接收方不更新窗口，发送方自然阻塞（背压）。
 - 接收方关闭流时，丢弃的已接收字节仍计入 session consumed，并立即回补 session credit。
 - 丢弃未知/已关闭流的数据时，同样计入 session consumed 并回补，避免发送方永久阻塞。
@@ -288,8 +304,11 @@
   - 必须读取并丢弃 payload；
   - 计入 session consumed；
   - 立即回补 session credit；
-  - 计入 unknown-stream budget（默认 1 MiB 或 8 × session window，取较大者）。
-- 超过预算 → `GOAWAY(ENHANCE_YOUR_CALM)` 并关闭。
+  - 计入 unknown-stream budget（默认 1 MiB 或 8 × session window，取较大者，
+    自动推导值上限 256 MiB）。
+- unknown-stream budget 是 token bucket：60 秒回满，按需在遇到下一帧未知流数据时
+  惰性补充。这样正常的关闭竞态不会在长连接上永久累积并最终误杀 session。
+- 超过预算 → 尽力发送 `GOAWAY(ENHANCE_YOUR_CALM)`，然后关闭。
 - 对端对已 RST 的流继续发数据，同样走上述逻辑；发送方应尽快停止。
 
 ---
@@ -343,9 +362,9 @@
 | keepalive_interval | 10s | 0 或 >0 |
 | keepalive_timeout | 30s | >= interval |
 | max_concurrent_streams | 0xFFFFFFFF | 0..0xFFFFFFFF |
-| unknown_stream_budget | max(1 MiB, 8 × session_window) | >0 |
+| unknown_stream_budget | token bucket，60s 回满；自动值 max(1 MiB, 8 × session_window)，上限 256 MiB | >0 |
 | accept backlog | 1024 | >0 |
-| 单批上限 | 64 KiB | 1..1 MiB |
+| 单批上限 | 128 KiB | 1..1 MiB |
 | 单批最大帧数 | 64 | 1..256 |
 
 ---

@@ -421,7 +421,7 @@ func TestBatchedKeepAlive(t *testing.T) {
 	waitSettings(t, srv)
 
 	deadline := time.Now().Add(2 * time.Second)
-	for cli.lastRTT.Load() == 0 || srv.lastRTT.Load() == 0 {
+	for cli.RTT() == 0 || srv.RTT() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("timed out waiting for PONG")
 		}

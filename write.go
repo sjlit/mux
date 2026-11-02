@@ -144,7 +144,19 @@ func (st *Stream) Write(b []byte) (int, error) {
 			hdrArena := sess.directHdr[:0]
 			vec := sess.directVec[:0]
 			infos := sess.directInfos[:0]
-			ok := sess.writeFrames(nil, pending, &hdrArena, &vec, &infos)
+			// Re-check the stream state after the frame-building work but
+			// before the actual write. Close may have queued a FIN while this
+			// Write was preparing its burst; dropping the burst here keeps
+			// data from appearing after the FIN on the wire.
+			ok := sess.writeFramesCheck(nil, pending, &hdrArena, &vec, &infos, func() error {
+				if st.closing.Load() {
+					return ErrWriteClosed
+				}
+				if st.aborted.Load() {
+					return st.getErr()
+				}
+				return nil
+			})
 			sess.directMu.Unlock()
 			var firstErr error
 			for _, batch := range pending {
@@ -171,7 +183,12 @@ func (st *Stream) Write(b []byte) (int, error) {
 		for _, batch := range pending {
 			batch.done = getDoneChan()
 		}
-		st.sess.enqueueBatches(st, pending)
+		if !st.submitBatches(pending) {
+			if err := st.checkWriteState(); err != nil {
+				return err
+			}
+			return ErrWriteClosed
+		}
 		out = append(out, pending...)
 		pending = pending[:0]
 		pendingBytes = 0
@@ -446,6 +463,19 @@ func (s *Session) enqueueBatch(st *Stream, b *writeBatch) {
 	s.enqueueBatches(st, []*writeBatch{b})
 }
 
+// submitBatches serializes a data burst with FIN/RST submission. It rejects
+// new data once the stream is closing or aborted, so a teardown frame queued
+// by Close can never be followed by data from an in-flight Write.
+func (st *Stream) submitBatches(batches []*writeBatch) bool {
+	st.submitMu.Lock()
+	defer st.submitMu.Unlock()
+	if st.closing.Load() || st.aborted.Load() {
+		return false
+	}
+	st.sess.enqueueBatches(st, batches)
+	return true
+}
+
 // enqueueBatches appends a burst of frames from one stream under a single lock
 // and wakes the writer once. Keeping the burst together lets the writer put all
 // frames of one Write into one writev instead of racing the enqueue loop.
@@ -596,6 +626,13 @@ type frameInfo struct {
 // writeFrames writes one batch (control frames first, then data frames) with a
 // single scatter-gather call when the connection supports it.
 func (s *Session) writeFrames(ctrl []ctrlMsg, data []*writeBatch, hdrArena *[]byte, vec *[][]byte, infos *[]frameInfo) bool {
+	return s.writeFramesCheck(ctrl, data, hdrArena, vec, infos, nil)
+}
+
+// writeFramesCheck is writeFrames with an optional admission check. The check
+// runs under connMu, immediately before the write, so a caller on the direct
+// path can reject a burst after Close queued a teardown frame.
+func (s *Session) writeFramesCheck(ctrl []ctrlMsg, data []*writeBatch, hdrArena *[]byte, vec *[][]byte, infos *[]frameInfo, check func() error) bool {
 	totalFrames := len(ctrl) + len(data)
 	if totalFrames == 0 {
 		return true
@@ -636,6 +673,29 @@ func (s *Session) writeFrames(ctrl []ctrlMsg, data []*writeBatch, hdrArena *[]by
 		}
 		*infos = (*infos)[:0]
 		s.fail(err)
+		return false
+	}
+
+	// failBeforeWrite completes the batches without failing the session. It is
+	// used when the direct-path admission check rejects a burst because the
+	// stream was closed while the frames were being prepared.
+	failBeforeWrite := func(err error) bool {
+		clearVec()
+		for _, b := range data {
+			if !b.written.Load() {
+				b.stream.refund(len(b.data))
+			}
+			b.complete(0, err)
+		}
+		for _, c := range ctrl {
+			if c.done != nil {
+				close(c.done)
+			}
+		}
+		for i := range *infos {
+			(*infos)[i] = frameInfo{}
+		}
+		*infos = (*infos)[:0]
 		return false
 	}
 
@@ -683,6 +743,13 @@ func (s *Session) writeFrames(ctrl []ctrlMsg, data []*writeBatch, hdrArena *[]by
 		i++
 	}
 
+	s.connMu.Lock()
+	if check != nil {
+		if err := check(); err != nil {
+			s.connMu.Unlock()
+			return failBeforeWrite(err)
+		}
+	}
 	for _, b := range data {
 		if n := len(b.data); n > 0 {
 			b.stream.numWritten.Add(uint32(n))
@@ -693,7 +760,6 @@ func (s *Session) writeFrames(ctrl []ctrlMsg, data []*writeBatch, hdrArena *[]by
 		b.written.Store(true)
 	}
 
-	s.connMu.Lock()
 	n, err := s.writeVec(*vec)
 	s.connMu.Unlock()
 	// Do not retain payload slices (which may point into caller buffers) in

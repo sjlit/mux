@@ -36,11 +36,19 @@ type Stream struct {
 	numWritten   atomic.Uint32
 	reserved     atomic.Uint32
 
-	writeMu     sync.Mutex
+	writeMu sync.Mutex // serializes Write calls
+
+	// submitMu orders data submissions with FIN/RST. It is held only while
+	// enqueueing a burst, never while waiting for it to be written, so Close
+	// can queue a teardown frame even if a concurrent Write is blocked in
+	// conn.Write.
+	submitMu sync.Mutex
+
 	sendQ       []*writeBatch // protected by sess.sendMu
 	sendHead    int           // protected by sess.sendMu
 	inActive    bool          // protected by sess.sendMu
-	writeClosed bool          // protected by writeMu
+	closing     atomic.Bool
+	writeClosed atomic.Bool
 	finQueued   atomic.Bool
 	writeStop   chan struct{}
 	stopOnce    sync.Once
@@ -201,6 +209,12 @@ func (st *Stream) Read(b []byte) (int, error) {
 			return n, err
 		}
 
+		// Advertise everything consumed so far before sleeping. The regular
+		// half-window update policy can otherwise leave the peer blocked: an
+		// application may consume part of a stream, then wait for more data
+		// while the session window is exhausted by other streams.
+		st.flushConsumed()
+
 		var timer *time.Timer
 		var timeout <-chan time.Time
 		if !deadline.IsZero() {
@@ -272,7 +286,7 @@ func (st *Stream) tryRead(b []byte) (int, error) {
 		st.consumed.Add(uint32(n))
 		st.sess.sessionConsumed.Add(uint32(n))
 		st.maybeSendStreamUPD()
-		st.sess.maybeSendSessionUPD()
+		st.sess.publishSessionCredit()
 		st.tryCleanup()
 		if more {
 			st.readNotify.notify()
@@ -346,6 +360,7 @@ func (st *Stream) handleData(f wire.Frame, owner frameOwner) {
 		err := st.push(f.Payload, owner)
 		if err == nil {
 			st.readNotify.notify()
+			st.sess.maybeSendSessionUPDOnPressure()
 		} else {
 			st.sess.bufferedFrames.Add(-1)
 			owner.release()
@@ -355,7 +370,7 @@ func (st *Stream) handleData(f wire.Frame, owner frameOwner) {
 			}
 			st.consumed.Add(uint32(n))
 			st.sess.sessionConsumed.Add(uint32(n))
-			st.sess.maybeSendSessionUPD()
+			st.sess.publishSessionCredit()
 		}
 	} else {
 		owner.release()
@@ -377,7 +392,7 @@ func (st *Stream) discardData(n int, owner frameOwner) {
 	st.sess.sessionRecvBytes.Add(uint32(n))
 	st.consumed.Add(uint32(n))
 	st.sess.sessionConsumed.Add(uint32(n))
-	st.sess.maybeSendSessionUPD()
+	st.sess.publishSessionCredit()
 }
 
 func (st *Stream) checkRecvWindow(n int) bool {
@@ -402,22 +417,41 @@ func (st *Stream) applyPeerCredit(consumed uint32) {
 }
 
 func (st *Stream) maybeSendStreamUPD() {
+	st.sendStreamUPD(false)
+}
+
+// sendStreamUPD advertises the absolute consumed counter. When force is true
+// it ignores the half-window threshold; callers use it before blocking so a
+// consumer that stops at a message boundary cannot leave the peer without
+// credit.
+func (st *Stream) sendStreamUPD(force bool) {
 	if st.aborted.Load() || st.removed.Load() {
 		return
 	}
 	consumed := st.consumed.Load()
 	threshold := int32(st.recvWindow / 2)
-	if itimediff(consumed, st.lastSentConsumed.Load()) < threshold {
-		return
-	}
+
 	st.updMu.Lock()
-	if itimediff(consumed, st.lastSentConsumed.Load()) < threshold {
+	delta := itimediff(consumed, st.lastSentConsumed.Load())
+	if delta <= 0 || (!force && delta < threshold) {
 		st.updMu.Unlock()
 		return
 	}
 	st.lastSentConsumed.Store(consumed)
 	st.updMu.Unlock()
 	st.sess.enqueueCtrl(wire.NewUPDFrame(st.id, consumed))
+}
+
+// flushConsumed publishes pending credit when the session receive window is
+// under pressure. Sending unconditionally on every blocking Read would turn a
+// request/response workload into one UPD frame per message; limiting it to
+// window pressure still prevents the cross-stream head-of-line deadlock.
+func (st *Stream) flushConsumed() {
+	if !st.sess.sessionWindowPressure() {
+		return
+	}
+	st.sendStreamUPD(true)
+	st.sess.sendSessionUPD(true)
 }
 
 func (st *Stream) discardBuffered() {
@@ -443,7 +477,10 @@ func (st *Stream) discardBuffered() {
 	if n > 0 {
 		st.consumed.Add(uint32(n))
 		st.sess.sessionConsumed.Add(uint32(n))
-		st.sess.maybeSendSessionUPD()
+		// Closing/resetting a stream can release a large amount of buffered
+		// data. Publish it immediately so other streams are not left blocked
+		// on the session window.
+		st.sess.sendSessionUPD(true)
 	}
 }
 
@@ -467,14 +504,13 @@ func (st *Stream) abortLocal(err error, sendRST bool, code wire.ErrorCode) {
 	st.readNotify.notify()
 	st.sess.creditNotify.notify()
 	if sendRST {
-		// Let an in-flight data write finish before queueing the RST. The
-		// writer may be on the direct path and therefore not visible to the
-		// session queue; writeMu is the per-stream ordering point for both
-		// paths. The stream is already aborted, so a blocked Write wakes and
-		// returns rather than starting a new frame.
-		st.writeMu.Lock()
+		// Submit the RST through the same gate as data. A direct write that
+		// already holds connMu finishes first; one that has not reached the
+		// write sees aborted/closing and drops its burst. Do not wait for
+		// writeMu here: a Write blocked in conn.Write must not make Reset hang.
+		st.submitMu.Lock()
 		st.sess.enqueueCtrl(wire.NewRSTFrame(st.id, code))
-		st.writeMu.Unlock()
+		st.submitMu.Unlock()
 	}
 }
 
@@ -517,9 +553,20 @@ func (st *Stream) sessionReadError(err error) {
 }
 
 // CloseWrite half-closes the stream after all queued data has been written.
+// It waits at most CloseTimeout (or an earlier write deadline) for an
+// in-flight Write to finish and for the FIN frame to be written.
 func (st *Stream) CloseWrite() error {
-	st.writeMu.Lock()
-	if st.writeClosed {
+	deadline := time.Now().Add(st.sess.config.CloseTimeout)
+	if wd := st.writeDeadlineTime(); !wd.IsZero() && wd.Before(deadline) {
+		deadline = wd
+	}
+	if !time.Now().Before(deadline) {
+		return ErrTimeout
+	}
+	if !st.lockWriteUntil(deadline) {
+		return ErrTimeout
+	}
+	if st.writeClosed.Load() || st.closing.Load() {
 		st.writeMu.Unlock()
 		return ErrWriteClosed
 	}
@@ -529,68 +576,102 @@ func (st *Stream) CloseWrite() error {
 		return err
 	}
 
-	st.writeClosed = true
-	st.finQueued.Store(true)
 	b := newWriteBatch(st, nil, wire.FlagFIN, getDoneChan())
+	st.submitMu.Lock()
+	if st.writeClosed.Load() || st.closing.Load() {
+		st.submitMu.Unlock()
+		st.writeMu.Unlock()
+		b.release()
+		return ErrWriteClosed
+	}
+	st.writeClosed.Store(true)
+	st.finQueued.Store(true)
 	st.sess.enqueueBatch(st, b)
+	st.submitMu.Unlock()
 	st.writeMu.Unlock()
 
-	_, err := st.awaitBatch(b, time.Now().Add(st.sess.config.CloseTimeout), false)
-	b.release()
+	_, err, done := st.awaitFin(b, deadline)
+	if done {
+		b.release()
+	}
 	if err != nil {
-		st.finQueued.Store(false)
+		if done {
+			st.submitMu.Lock()
+			st.finQueued.Store(false)
+			st.submitMu.Unlock()
+		}
 		return err
 	}
 	st.tryCleanup()
 	return nil
 }
 
-// Close closes both directions of the stream. Queued writes are flushed and
-// followed by a FIN; the read side is abandoned immediately. It can wait for
-// an in-flight Write, including a blocked conn.Write.
+// Close closes both directions of the stream. Already queued writes are
+// flushed and followed by a FIN; the read side is abandoned immediately.
+// If unread data remains and the peer may still send, Close sends RST(CANCEL)
+// instead, as required by the protocol.
+//
+// Close no longer waits for writeMu before queueing the teardown frame, so a
+// concurrent Write blocked in conn.Write cannot prevent Close from returning.
+// The FIN itself is bounded by CloseTimeout; on timeout Close returns
+// ErrTimeout and the FIN may still be written in the background.
 func (st *Stream) Close() error {
 	st.stopOnce.Do(func() { close(st.writeStop) })
 
 	st.setErr(ErrStreamClosed)
 	st.closeDie()
+	unread := !st.ringEmpty() && !st.remoteFIN.Load()
 	st.discardBuffered()
 	st.readNotify.notify()
 	st.sess.creditNotify.notify()
+	st.closing.Store(true)
 
 	var fin *writeBatch
-	st.writeMu.Lock()
-	st.writeClosed = true
-	if !st.aborted.Load() && !st.finQueued.Load() {
+	st.submitMu.Lock()
+	st.writeClosed.Store(true)
+	if unread {
+		// The peer may keep sending; tell it to stop instead of relying on
+		// unknown-stream discards after the stream is removed.
+		st.aborted.Store(true)
+		st.sess.enqueueCtrl(wire.NewRSTFrame(st.id, wire.CodeCancel))
+	} else if !st.aborted.Load() && !st.finQueued.Load() {
 		st.finQueued.Store(true)
 		fin = newWriteBatch(st, nil, wire.FlagFIN, getDoneChan())
 		st.sess.enqueueBatch(st, fin)
 	}
-	st.writeMu.Unlock()
+	st.submitMu.Unlock()
 
 	var err error
 	if fin != nil {
-		_, err = st.awaitFinal(fin, time.Now().Add(st.sess.config.CloseTimeout))
-		fin.release()
-		if err != nil {
+		var done bool
+		_, err, done = st.awaitFin(fin, time.Now().Add(st.sess.config.CloseTimeout))
+		if done {
+			fin.release()
+		}
+		if err != nil && done {
+			st.submitMu.Lock()
 			st.finQueued.Store(false)
+			st.submitMu.Unlock()
 		}
 	}
 	st.sess.removeStream(st)
 	return err
 }
 
-// awaitFinal waits for a FIN enqueued by Close itself. It deliberately ignores
-// writeStop and the stream die channel: Close closes both before enqueueing the
-// FIN to unblock concurrent writers, and cancelling its own FIN would leave the
-// peer with a half-open stream.
-func (st *Stream) awaitFinal(b *writeBatch, deadline time.Time) (int, error) {
+// awaitFin waits for a FIN batch. On timeout it returns ErrTimeout without
+// cancelling or waiting for the batch: the FIN has no payload, so it is safe
+// to let the writer finish it in the background even after Close returns.
+// The done result reports whether b was observed complete, so the caller may
+// safely release it. On timeout the batch may still be referenced by the
+// writer; it is left for the garbage collector rather than racing a pooled
+// reuse.
+func (st *Stream) awaitFin(b *writeBatch, deadline time.Time) (int, error, bool) {
 	if deadline.IsZero() {
 		select {
 		case <-b.done:
-			return b.n, b.err
+			return b.n, b.err, true
 		case <-st.sess.die:
-			<-b.done
-			return st.batchResult(b, st.sess.closeError())
+			return 0, st.sess.closeError(), false
 		}
 	}
 
@@ -599,26 +680,48 @@ func (st *Stream) awaitFinal(b *writeBatch, deadline time.Time) (int, error) {
 
 	select {
 	case <-b.done:
-		return b.n, b.err
+		return b.n, b.err, true
 	case <-timer.C:
-		b.canceled.Store(true)
-		st.sess.signal()
-		<-b.done
-		if b.err != nil {
-			return b.n, b.err
-		}
-		if b.n == len(b.data) {
-			return b.n, nil
-		}
-		return b.n, ErrTimeout
+		return 0, ErrTimeout, false
 	case <-st.sess.die:
-		<-b.done
-		return st.batchResult(b, st.sess.closeError())
+		return 0, st.sess.closeError(), false
 	}
 }
 
-// Reset aborts the stream and sends an RST with code. An in-flight Write is
-// allowed to finish first so the peer never observes data after the RST.
+// lockWriteUntil acquires writeMu, waiting at most until deadline. It is used
+// only by CloseWrite, where blocking forever behind a peer-stalled Write would
+// be worse than returning ErrTimeout.
+func (st *Stream) lockWriteUntil(deadline time.Time) bool {
+	if st.writeMu.TryLock() {
+		return true
+	}
+	if deadline.IsZero() {
+		st.writeMu.Lock()
+		return true
+	}
+	if !time.Now().Before(deadline) {
+		return false
+	}
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer stopTimer(timer)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-timer.C:
+			return false
+		case <-ticker.C:
+			if st.writeMu.TryLock() {
+				return true
+			}
+		}
+	}
+}
+
+// Reset aborts the stream and sends an RST with code. Unsent data is
+// discarded; a direct write already inside conn.Write is ordered before the
+// RST, so the peer never observes data after it.
 func (st *Stream) Reset(code wire.ErrorCode) error {
 	st.stopOnce.Do(func() { close(st.writeStop) })
 	st.abortLocal(newStreamError(st.id, code), true, code)
@@ -665,7 +768,7 @@ func (st *Stream) checkWriteState() error {
 		return ErrWriteClosed
 	default:
 	}
-	if st.writeClosed {
+	if st.writeClosed.Load() || st.closing.Load() {
 		return ErrWriteClosed
 	}
 	select {

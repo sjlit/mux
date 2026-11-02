@@ -77,8 +77,13 @@ go test -v -run=^$ -bench .
   blocking while holding locks.
 - A caller must not return from `Write` while a started request still
   references its payload.
-- Data-frame admission and FIN submission share the per-stream gate; never
-  hold that gate while waiting for `conn.Write`.
+- Data-frame admission and FIN/RST submission share the per-stream
+  `submitMu`; never hold that gate while waiting for `conn.Write`. Teardown
+  paths (`Close`, `CloseWrite`, `Reset`) must not wait for a `writeMu` held by
+  a Write that is blocked in `conn.Write`.
+- Pending stream/session credit is flushed when the session receive buffer is
+  under pressure and before `Read` blocks; do not rely only on the half-window
+  threshold, or multi-stream traffic can deadlock on the session window.
 - Do not log payloads. Error messages should contain only type, stream ID,
   length, and error code.
 
