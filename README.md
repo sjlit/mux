@@ -2,6 +2,7 @@
 
 mux is a multiplexing library for Go built on the next-generation smux wire
 protocol (version 3). It is derived from the v3 work in
+[`uole/smux`](https://github.com/uole/smux), which is based on
 [`xtaci/smux`](https://github.com/xtaci/smux).
 
 - [`PROTOCOL.md`](PROTOCOL.md): normative wire protocol specification.
